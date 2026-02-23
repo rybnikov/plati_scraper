@@ -33,12 +33,18 @@ If your MCP client hangs on initialize, run server with debug stderr enabled:
 4. Include clickable listing links and selected option text in final output.
 5. Clearly state filters used by the agent.
 
-## Output format
+## Output format (Telegram-friendly)
 
-Return a compact ranked list based on agent-side filtering:
+Do not use markdown tables or code blocks for final user messages.
 
-`<rank>. <selected price> | <seller> | <selected duration> | <link>`
+Return only a short numbered list with readable text and working links:
 
-Include a one-line summary:
+`1. <Название> — <цена>, <срок>, <продавец> (<рейтинг/отзывы>). Ссылка: <url>`
 
-`Returned X lots after agent filtering from Y raw lots`
+`2. ...`
+
+After the list, add one short summary line:
+
+`Проверено X лотов, выбрано Y лучших по вашим условиям.`
+
+If links are present in MCP results, always include direct lot links in each list item.
