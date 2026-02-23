@@ -21,21 +21,47 @@ except Exception as e:  # pragma: no cover - defensive path
 
 
 def _read_message() -> Dict[str, Any]:
+    # Dual framing support:
+    # 1) MCP/LSP-style Content-Length headers + JSON body
+    # 2) NDJSON (one JSON message per line)
+    #
+    # We auto-detect by first line and keep response framing symmetrical.
+    first = sys.stdin.buffer.readline()
+    if not first:
+        raise EOFError
+
+    # NDJSON path.
+    stripped = first.strip()
+    if stripped.startswith(b"{"):
+        _STATE["framing"] = "ndjson"
+        return json.loads(stripped.decode("utf-8"))
+
+    # Content-Length path.
     headers: Dict[str, str] = {}
+    line = first
     while True:
+        if line in (b"\r\n", b"\n"):
+            break
+        decoded = line.decode("utf-8")
+        if ":" not in decoded:
+            raise ValueError("Invalid header line")
+        key, value = decoded.split(":", 1)
+        headers[key.strip().lower()] = value.strip()
         line = sys.stdin.buffer.readline()
         if not line:
             raise EOFError
-        if line in (b"\r\n", b"\n"):
-            break
-        key, value = line.decode("utf-8").split(":", 1)
-        headers[key.strip().lower()] = value.strip()
     content_length = int(headers.get("content-length", "0"))
     payload = sys.stdin.buffer.read(content_length)
+    _STATE["framing"] = "content-length"
     return json.loads(payload.decode("utf-8"))
 
 
 def _write_message(msg: Dict[str, Any]) -> None:
+    if _STATE.get("framing") == "ndjson":
+        line = json.dumps(msg, ensure_ascii=False) + "\n"
+        sys.stdout.write(line)
+        sys.stdout.flush()
+        return
     data = json.dumps(msg, ensure_ascii=False).encode("utf-8")
     header = f"Content-Length: {len(data)}\r\n\r\n".encode("utf-8")
     sys.stdout.buffer.write(header)
@@ -137,6 +163,8 @@ TOOL_SCHEMA = {
         "required": ["query"],
     },
 }
+
+_STATE: Dict[str, str] = {"framing": "content-length"}
 
 
 def _handle_request(msg: Dict[str, Any]) -> Dict[str, Any]:
