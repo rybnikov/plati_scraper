@@ -13,6 +13,7 @@ from urllib.request import Request, urlopen
 SEARCH_ENDPOINT = "https://api.digiseller.com/api/cataloguer/front/products"
 PRODUCT_DATA_ENDPOINT = "https://api.digiseller.com/api/products/{product_id}/data"
 REVIEWS_ENDPOINT = "https://api.digiseller.com/api/reviews"
+CATEGORY_BLOCK_ENDPOINT = "https://plati.market/asp/block_goods_category_2.asp"
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
@@ -40,12 +41,24 @@ SEARCH_SORT_MAP = {
     "price_desc": "popular",
     "new": "popular",
 }
+CATEGORY_SORT_MAP = {
+    "popular": "",
+    "price_asc": "price",
+    "price_desc": "-price",
+    "new": "",
+}
 
 
 def fetch_json(url: str, timeout: int = 30) -> Dict:
     req = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
     with urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8", errors="replace"))
+
+
+def fetch_text(url: str, timeout: int = 30) -> str:
+    req = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html,*/*"})
+    with urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", errors="replace")
 
 
 def parse_search_query(search_url: str) -> str:
@@ -56,9 +69,17 @@ def parse_search_query(search_url: str) -> str:
     return unquote(m.group(1))
 
 
-def build_search_url(query: str, page: int, count: int, currency: str, lang: str, sort_by: str) -> str:
+def build_search_url(
+    query: str,
+    page: int,
+    count: int,
+    currency: str,
+    lang: str,
+    sort_by: str,
+    category_id: str = "",
+) -> str:
     params = {
-        "categoryId": "",
+        "categoryId": category_id,
         "getProductsRecursive": "true",
         "sellerCategoryId": "",
         "productId": "",
@@ -106,6 +127,72 @@ def build_reviews_url(seller_id: int, lang: str) -> str:
 
 def normalize_search_sort(sort_by: str) -> str:
     return SEARCH_SORT_MAP.get(sort_by, "popular")
+
+
+def normalize_category_sort(sort_by: str) -> str:
+    return CATEGORY_SORT_MAP.get(sort_by, "")
+
+
+def build_category_block_url(
+    category_id: str,
+    page: int,
+    rows: int,
+    currency: str,
+    lang: str,
+    sort_by: str,
+    subcategory_id: int = 0,
+) -> str:
+    params = {
+        "id_cb": str(category_id),
+        "id_c": str(subcategory_id),
+        "sort": normalize_category_sort(sort_by),
+        "page": str(page),
+        "rows": str(rows),
+        "curr": currency.lower(),
+        "lang": (lang or "ru-RU").split("-")[0],
+    }
+    return f"{CATEGORY_BLOCK_ENDPOINT}?{urlencode(params)}"
+
+
+def _strip_tags(value: str) -> str:
+    value = re.sub(r"<[^>]+>", " ", value or "", flags=re.DOTALL)
+    return clean_text(html.unescape(value))
+
+
+def parse_category_block_items(block_html: str) -> List[Dict[str, Union[int, float, str]]]:
+    items: List[Dict[str, Union[int, float, str]]] = []
+    if not block_html:
+        return items
+    for m in re.finditer(r"<a[^>]*product_id=\"(\d+)\"[^>]*>(.*?)</a>", block_html, flags=re.DOTALL | re.IGNORECASE):
+        pid = int(m.group(1))
+        card_html = m.group(0)
+        href_m = re.search(r'href=\"([^\"]+)\"', card_html, flags=re.IGNORECASE)
+        title_m = re.search(r'title=\"([^\"]+)\"', card_html, flags=re.IGNORECASE)
+        seller_m = re.search(
+            r"text-truncate[^>]*>([^<]+)</span>",
+            card_html,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        price_m = re.search(r"h5-bold[^>]*>([^<]+)</span>", card_html, flags=re.DOTALL | re.IGNORECASE)
+        price_value = 0.0
+        if price_m:
+            p = re.sub(r"[^\d,.\-]", "", price_m.group(1)).replace(",", ".")
+            try:
+                price_value = float(p)
+            except Exception:
+                price_value = 0.0
+        href = href_m.group(1) if href_m else f"/itm/i/{pid}"
+        link = href if href.startswith("http://") or href.startswith("https://") else f"https://plati.market{href}"
+        items.append(
+            {
+                "product_id": pid,
+                "link": link,
+                "title": _strip_tags(title_m.group(1) if title_m else ""),
+                "seller_name": _strip_tags(seller_m.group(1) if seller_m else ""),
+                "price": price_value,
+            }
+        )
+    return items
 
 
 def pick_name(name_entries: List[Dict], lang: str) -> str:
@@ -465,6 +552,7 @@ def search_all_products(
     max_pages: int,
     request_text: str = "pro",
     return_all_choices: bool = False,
+    category_id: str = "",
 ) -> List[Dict]:
     query = parse_search_query(search_url)
     rows = []
@@ -475,7 +563,7 @@ def search_all_products(
     warned_sort_fallback = False
 
     while len(rows) < max_items and page <= max_pages:
-        api_url = build_search_url(query, page, per_page, currency, lang, api_sort)
+        api_url = build_search_url(query, page, per_page, currency, lang, api_sort, category_id=category_id)
         try:
             payload = fetch_json(api_url)
         except HTTPError as e:

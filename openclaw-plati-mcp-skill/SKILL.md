@@ -21,9 +21,12 @@ If your MCP client hangs on initialize, run server with debug stderr enabled:
 
 1. Call MCP tool `find_cheapest_reliable_options` with:
    - `query`: user search intent
-   - `limit`: requested lots count (default 5)
+   - `limit`: requested lots count (default 20)
+   - `sort_by`: `price_asc` (default), `price_desc`, `seller_reviews_desc`, `reliability_desc`, `title_asc`, `title_desc`
    - `min_reviews`: optional seller reliability filter (default 0)
    - `min_positive_ratio`: optional seller reliability filter (default 0)
+   - `min_price` / `max_price`: optional numeric range
+   - `include_terms` / `exclude_terms`: optional token filters
    - `max_pages`: default 6 for broader scan
 2. Treat response as raw market data:
    - each lot includes `options[]`

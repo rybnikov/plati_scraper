@@ -2,10 +2,11 @@
 import json
 import os
 import pathlib
+import re
 import sys
 import warnings
 from typing import Any, Dict, List
-from urllib.parse import quote
+from urllib.parse import parse_qs, unquote, urlparse
 
 # Ensure local imports work even when launcher does not pass PYTHONPATH/cwd.
 _HERE = pathlib.Path(__file__).resolve().parent
@@ -85,33 +86,166 @@ def _parse_good_bad(value: str) -> Dict[str, int]:
         return {"good": 0, "bad": 0}
 
 
+def _parse_query_input(query: str) -> Dict[str, str]:
+    q = (query or "").strip()
+    out = {"product_query": q, "category_id": "", "source_url": ""}
+    if not q.startswith("http://") and not q.startswith("https://"):
+        return out
+
+    parsed = urlparse(q)
+    path = parsed.path or ""
+    qs = parse_qs(parsed.query or "")
+    out["source_url"] = q
+
+    # Search root URL with optional query params.
+    if path.rstrip("/") == "/search":
+        for key in ("q", "query", "text", "term", "search", "searchString", "SearchStr"):
+            v = (qs.get(key) or [""])[0].strip()
+            if v:
+                out["product_query"] = unquote(v)
+                return out
+        out["product_query"] = ""
+        return out
+
+    # Standard search URL: /search/<term>
+    m = re.search(r"/search/([^/?#]+)", path)
+    if m:
+        out["product_query"] = unquote(m.group(1)).replace("-", " ").strip()
+        return out
+
+    # Category-like URL: /games/<slug>/<id>/ or similar.
+    cat = re.search(r"/([^/]+)/([^/]+)/(\d+)/?$", path)
+    if cat:
+        slug = unquote(cat.group(2)).replace("-", " ").strip()
+        out["product_query"] = slug or out["product_query"]
+        out["category_id"] = cat.group(3)
+        return out
+
+    # Fallback: use last non-empty path part as query.
+    parts = [unquote(p) for p in path.split("/") if p]
+    if parts:
+        out["product_query"] = parts[-1].replace("-", " ").strip()
+    return out
+
+
+def _split_terms(value: str) -> List[str]:
+    if not value:
+        return []
+    return [t for t in re.split(r"[\s,;|]+", value.lower()) if t]
+
+
+def _build_offer_search_text(title: str, options: List[Dict[str, Any]]) -> str:
+    parts = [title or ""]
+    for opt in options:
+        parts.append(str(opt.get("name") or ""))
+        parts.append(str(opt.get("label") or ""))
+        for v in opt.get("variants") or []:
+            parts.append(str(v.get("text") or ""))
+    return " ".join(parts).lower()
+
+
+def _sort_lots(items: List[Dict[str, Any]], sort_by: str) -> List[Dict[str, Any]]:
+    if sort_by == "price_desc":
+        return sorted(items, key=lambda x: (float(x.get("min_option_price", 0.0)), int(x.get("seller_reviews", 0))), reverse=True)
+    if sort_by == "seller_reviews_desc":
+        return sorted(items, key=lambda x: (int(x.get("seller_reviews", 0)), float(x.get("positive_ratio", 0.0)), -float(x.get("min_option_price", 0.0))), reverse=True)
+    if sort_by == "reliability_desc":
+        return sorted(items, key=lambda x: (float(x.get("positive_ratio", 0.0)), int(x.get("seller_reviews", 0)), -float(x.get("min_option_price", 0.0))), reverse=True)
+    if sort_by == "title_asc":
+        return sorted(items, key=lambda x: str(x.get("title", "")).lower())
+    if sort_by == "title_desc":
+        return sorted(items, key=lambda x: str(x.get("title", "")).lower(), reverse=True)
+    # default and "price_asc"
+    return sorted(items, key=lambda x: (float(x.get("min_option_price", 0.0)), -int(x.get("seller_reviews", 0))))
+
+
 def find_cheapest_reliable_options(
     query: str,
-    limit: int = 5,
+    limit: int = 20,
     currency: str = "RUB",
     lang: str = "ru-RU",
     min_reviews: int = 0,
     min_positive_ratio: float = 0.0,
     max_pages: int = 6,
     per_page: int = 30,
+    sort_by: str = "price_asc",
+    min_price: float = 0.0,
+    max_price: float = 0.0,
+    include_terms: str = "",
+    exclude_terms: str = "",
 ) -> Dict[str, Any]:
     if plati_scrape is None:
         raise RuntimeError(f"plati_scrape import failed: {_PLATI_IMPORT_ERROR}")
 
-    q = quote(query, safe="")
+    parsed_q = _parse_query_input(query)
+    q = parsed_q["product_query"]
+    category_id = parsed_q["category_id"]
+    source_url = parsed_q["source_url"]
+    if not q and not category_id:
+        raise ValueError("Empty search query. Use /search/<term> or pass text query, e.g. 'chatgpt plus'.")
     lots: List[Dict[str, Any]] = []
     seller_cache: Dict[int, Dict[str, Any]] = {}
     page = 1
+    include_tokens = _split_terms(include_terms)
+    exclude_tokens = _split_terms(exclude_terms)
+    sort_norm = (sort_by or "price_asc").strip().lower()
+    if sort_norm not in {
+        "price_asc",
+        "price_desc",
+        "seller_reviews_desc",
+        "reliability_desc",
+        "title_asc",
+        "title_desc",
+    }:
+        sort_norm = "price_asc"
+    seen_product_ids: set[int] = set()
 
-    while page <= max_pages and len(lots) < max(1, int(limit)):
-        search_url = plati_scrape.build_search_url(q, page, per_page, currency, lang, "popular")
-        payload = plati_scrape.fetch_json(search_url)
-        content = payload.get("content") or {}
-        items = content.get("items") or []
-        if not items:
+    while page <= max_pages:
+        has_next_page = False
+        source_items: List[Dict[str, Any]] = []
+        if category_id:
+            block_url = plati_scrape.build_category_block_url(
+                category_id=category_id,
+                page=page,
+                rows=per_page,
+                currency=currency,
+                lang=lang,
+                sort_by=sort_norm,
+                subcategory_id=0,
+            )
+            block_html = plati_scrape.fetch_text(block_url)
+            parsed_items = plati_scrape.parse_category_block_items(block_html)
+            source_items = [
+                {
+                    "product_id": int(it.get("product_id") or 0),
+                    "seller_id": 0,
+                    "seller_name": str(it.get("seller_name") or ""),
+                    "price": float(it.get("price") or 0.0),
+                    "name": [{"locale": lang, "value": str(it.get("title") or "")}],
+                    "link": str(it.get("link") or ""),
+                }
+                for it in parsed_items
+            ]
+            has_next_page = bool(parsed_items)
+        else:
+            search_url = plati_scrape.build_search_url(
+                q,
+                page,
+                per_page,
+                currency,
+                lang,
+                "popular",
+                category_id="",
+            )
+            payload = plati_scrape.fetch_json(search_url)
+            content = payload.get("content") or {}
+            source_items = content.get("items") or []
+            has_next_page = bool(content.get("has_next_page"))
+
+        if not source_items:
             break
 
-        for item in items:
+        for item in source_items:
             pid = int(item.get("product_id") or 0)
             seller_id = int(item.get("seller_id") or 0)
             if pid <= 0:
@@ -130,9 +264,11 @@ def find_cheapest_reliable_options(
             if str(product.get("is_available", 1)).lower() in {"0", "false"}:
                 continue
 
+            if seller_id <= 0:
+                seller_id = int(((product.get("seller") or {}).get("id")) or 0)
             base_price = float(product.get("price") or item.get("price") or 0.0)
             title = plati_scrape.clean_text(str(product.get("name") or plati_scrape.pick_name(item.get("name") or [], lang)))
-            link = f"https://plati.market/itm/i/{pid}"
+            link = str(item.get("link") or f"https://plati.market/itm/i/{pid}")
             seller_name = str((product.get("seller") or {}).get("name") or item.get("seller_name") or "")
 
             if seller_id > 0 and seller_id not in seller_cache:
@@ -211,19 +347,47 @@ def find_cheapest_reliable_options(
                     "options": options_payload,
                 }
             )
-
-            if len(lots) >= max(1, int(limit)):
-                break
-        if len(lots) >= max(1, int(limit)):
-            break
-        if not content.get("has_next_page"):
+            offer_search_text = _build_offer_search_text(title, options_payload)
+            if include_tokens and not all(tok in offer_search_text for tok in include_tokens):
+                lots.pop()
+                continue
+            if exclude_tokens and any(tok in offer_search_text for tok in exclude_tokens):
+                lots.pop()
+                continue
+            if min_price > 0 and float(min_option_price) < float(min_price):
+                lots.pop()
+                continue
+            if max_price > 0 and float(min_option_price) > float(max_price):
+                lots.pop()
+                continue
+            if pid in seen_product_ids:
+                lots.pop()
+                continue
+            seen_product_ids.add(pid)
+        if not has_next_page:
             break
         page += 1
 
-    lots.sort(key=lambda x: (x["min_option_price"], -int(x.get("seller_reviews", 0))))
+    lots = _sort_lots(lots, sort_norm)
     top = lots[: max(1, int(limit))]
     return {
         "query": query,
+        "normalized_query": parsed_q["product_query"],
+        "category_id": category_id,
+        "source_url": source_url,
+        "applied_filters": {
+            "sort_by": sort_norm,
+            "min_reviews": int(min_reviews),
+            "min_positive_ratio": float(min_positive_ratio),
+            "min_price": float(min_price),
+            "max_price": float(max_price),
+            "include_terms": include_tokens,
+            "exclude_terms": exclude_tokens,
+            "max_pages": int(max_pages),
+            "per_page": int(per_page),
+            "currency": currency,
+            "lang": lang,
+        },
         "total_candidates": len(lots),
         "reliable_candidates": len(lots),
         "returned": len(top),
@@ -233,18 +397,27 @@ def find_cheapest_reliable_options(
 
 TOOL_SCHEMA = {
     "name": "find_cheapest_reliable_options",
-    "description": "Find cheapest reliable Plati offers for PRO subscriptions.",
+    "description": "Find Plati offers by text query or Plati URL, returning lots with links and full option variants.",
     "inputSchema": {
         "type": "object",
         "properties": {
-            "query": {"type": "string", "description": "Search term, e.g. 'claude code'"},
-            "limit": {"type": "integer", "default": 5, "minimum": 1, "maximum": 50},
+            "query": {"type": "string", "description": "Text query (e.g. 'claude code') or Plati URL (/search/<term>, /games/.../<id>/, /cat/.../<id>/)."},
+            "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 100},
             "currency": {"type": "string", "default": "RUB"},
             "lang": {"type": "string", "default": "ru-RU"},
             "min_reviews": {"type": "integer", "default": 0, "minimum": 0},
             "min_positive_ratio": {"type": "number", "default": 0.0, "minimum": 0, "maximum": 1},
             "max_pages": {"type": "integer", "default": 6, "minimum": 1, "maximum": 30},
             "per_page": {"type": "integer", "default": 30, "minimum": 5, "maximum": 100},
+            "sort_by": {
+                "type": "string",
+                "default": "price_asc",
+                "enum": ["price_asc", "price_desc", "seller_reviews_desc", "reliability_desc", "title_asc", "title_desc"],
+            },
+            "min_price": {"type": "number", "default": 0},
+            "max_price": {"type": "number", "default": 0},
+            "include_terms": {"type": "string", "default": "", "description": "Space/comma-separated terms that must appear in lot title/options."},
+            "exclude_terms": {"type": "string", "default": "", "description": "Space/comma-separated terms to exclude from lot title/options."},
         },
         "required": ["query"],
     },
@@ -279,13 +452,18 @@ def _handle_request(msg: Dict[str, Any]) -> Dict[str, Any]:
         try:
             result = find_cheapest_reliable_options(
                 query=str(args["query"]),
-                limit=int(args.get("limit", 5)),
+                limit=int(args.get("limit", 20)),
                 currency=str(args.get("currency", "RUB")),
                 lang=str(args.get("lang", "ru-RU")),
-                min_reviews=int(args.get("min_reviews", 500)),
-                min_positive_ratio=float(args.get("min_positive_ratio", 0.98)),
+                min_reviews=int(args.get("min_reviews", 0)),
+                min_positive_ratio=float(args.get("min_positive_ratio", 0.0)),
                 max_pages=int(args.get("max_pages", 6)),
                 per_page=int(args.get("per_page", 30)),
+                sort_by=str(args.get("sort_by", "price_asc")),
+                min_price=float(args.get("min_price", 0.0)),
+                max_price=float(args.get("max_price", 0.0)),
+                include_terms=str(args.get("include_terms", "")),
+                exclude_terms=str(args.get("exclude_terms", "")),
             )
             return _ok(
                 req_id,

@@ -43,13 +43,16 @@ plati-mcp-server
 Input arguments:
 
 - `query` (required): Search phrase (for example `claude code`)
-- `limit` (default `5`)
+- `limit` (default `20`)
 - `currency` (default `RUB`)
 - `lang` (default `ru-RU`)
-- `min_reviews` (default `500`)
-- `min_positive_ratio` (default `0.98`)
+- `min_reviews` (default `0`)
+- `min_positive_ratio` (default `0.0`)
 - `max_pages` (default `6`)
 - `per_page` (default `30`)
+- `sort_by` (default `price_asc`): one of `price_asc`, `price_desc`, `seller_reviews_desc`, `reliability_desc`, `title_asc`, `title_desc`
+- `min_price` / `max_price` (optional numeric range)
+- `include_terms` / `exclude_terms` (optional space/comma-separated token filters applied to title/options text)
 
 ## Local development
 
