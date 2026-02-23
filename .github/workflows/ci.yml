@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Python compile check
+        run: python3 -m py_compile plati_scrape.py mcp_server.py
+
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -p "test_*.py"
+
+      - name: npm package dry-run
+        run: npm_config_cache=/tmp/npm-cache npm pack --dry-run

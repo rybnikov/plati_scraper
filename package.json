@@ -1,0 +1,29 @@
+{
+  "name": "plati-mcp-server",
+  "version": "0.1.0",
+  "description": "MCP stdio server for finding cheapest reliable subscription offers on Plati.",
+  "license": "MIT",
+  "type": "commonjs",
+  "bin": {
+    "plati-mcp-server": "bin/plati-mcp-server.js"
+  },
+  "files": [
+    "bin/plati-mcp-server.js",
+    "mcp_server.py",
+    "plati_scrape.py",
+    "README.md"
+  ],
+  "keywords": [
+    "mcp",
+    "openclaw",
+    "plati",
+    "scraper"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "plati-mcp-server",
+    "pack:check": "npm pack --dry-run"
+  }
+}
