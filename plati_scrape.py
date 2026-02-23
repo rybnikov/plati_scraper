@@ -27,6 +27,13 @@ SERVICE_OPTION_RX = re.compile(r"вариант|услуг|оказани|servic
 DURATION_OPTION_RX = re.compile(r"срок|duration|month|year|мес|год", flags=re.IGNORECASE)
 ACTIVATION_RX = re.compile(r"активац|продлен|activation|renewal", flags=re.IGNORECASE)
 ACCOUNT_CREATE_RX = re.compile(r"нет аккаунта|создайте|new account|выдач", flags=re.IGNORECASE)
+PLUS_RX = re.compile(r"\bplus\b|плюс", flags=re.IGNORECASE)
+GO_RX = re.compile(r"\bgo\b", flags=re.IGNORECASE)
+BUSINESS_RX = re.compile(r"\bbusiness\b|бизнес", flags=re.IGNORECASE)
+NOT_PRO_RX = re.compile(
+    r"\bне\s+нужн[а-я]*\s+подписк[а-я]*\s+pro\b|\bwithout\s+pro\b|\bno\s+pro\b|\bбез\s+pro\b",
+    flags=re.IGNORECASE,
+)
 SEARCH_SORT_MAP = {
     "popular": "popular",
     "price_asc": "popular",
@@ -194,11 +201,75 @@ def _modifier_only_price(base_price: float, variants: List[Dict], currency: str,
     return max(total, 0.0)
 
 
-def extract_pro_choice(product_payload: Dict, base_price: float, currency: str) -> Optional[Tuple[float, str, str]]:
+def _extract_duration_months(text: str) -> Optional[int]:
+    t = (text or "").lower()
+    m = re.search(r"(\d+)\s*(месяц|месяца|месяцев|мес|month|months|mo|m)\b", t)
+    if m:
+        return int(m.group(1))
+    y = re.search(r"(\d+)\s*(год|года|лет|year|years|yr)\b", t)
+    if y:
+        return int(y.group(1)) * 12
+    # "1-Month", "12-Month"
+    hm = re.search(r"(\d+)\s*[-–]\s*month\b", t)
+    if hm:
+        return int(hm.group(1))
+    return None
+
+
+def _parse_request_preferences(request_text: str) -> Dict:
+    t = (request_text or "").lower()
+    plans = set()
+    if PRO_RX.search(t):
+        plans.add("pro")
+    if PLUS_RX.search(t):
+        plans.add("plus")
+    if GO_RX.search(t):
+        plans.add("go")
+    if BUSINESS_RX.search(t):
+        plans.add("business")
+    if not plans:
+        # By default expose all common subscription plans.
+        plans = {"pro", "plus", "go", "business"}
+
+    months = set()
+    for m in re.finditer(r"(\d+)\s*(месяц|месяца|месяцев|мес|month|months|mo|m)\b", t):
+        months.add(int(m.group(1)))
+    for y in re.finditer(r"(\d+)\s*(год|года|лет|year|years|yr)\b", t):
+        months.add(int(y.group(1)) * 12)
+    if re.search(r"\bгод\b|\byear\b|12\s*(месяц|месяцев|month|months)\b", t):
+        months.add(12)
+    if re.search(r"\bмесяц\b|\bmonth\b", t):
+        months.add(1)
+
+    return {"plans": plans, "months": months}
+
+
+def _plan_tags(text: str) -> set:
+    low = (text or "").lower()
+    tags = set()
+    if PRO_RX.search(low) and not NOT_PRO_RX.search(low):
+        tags.add("pro")
+    if PLUS_RX.search(low):
+        tags.add("plus")
+    if GO_RX.search(low):
+        tags.add("go")
+    if BUSINESS_RX.search(low):
+        tags.add("business")
+    return tags
+
+
+def extract_matching_choices(
+    product_payload: Dict,
+    base_price: float,
+    currency: str,
+    request_text: str,
+    return_all: bool = False,
+) -> List[Tuple[float, str, str]]:
     product = product_payload.get("product") or {}
     options = product.get("options") or []
     rates = _build_rate_map(product)
-    candidates: List[Tuple[float, str, str]] = []
+    prefs = _parse_request_preferences(request_text)
+    candidates: List[Tuple[float, str, str, Optional[int]]] = []
 
     visible_options = []
     for option in options:
@@ -212,8 +283,21 @@ def extract_pro_choice(product_payload: Dict, base_price: float, currency: str) 
             return d
         return variants[0]
 
-    # Gather all PRO-capable variants from all selectable options.
-    pro_variants: List[Tuple[Dict, Dict]] = []
+    duration_option: Optional[Tuple[Dict, List[Dict]]] = None
+    for option, variants in visible_options:
+        label_text = f"{option.get('label','')} {option.get('name','')}".lower()
+        if DURATION_OPTION_RX.search(label_text):
+            duration_option = (option, variants)
+            break
+    # Fallback: some products encode duration inside activation method option.
+    if duration_option is None:
+        for option, variants in visible_options:
+            if any(_extract_duration_months(clean_text(str(v.get("text", "")))) is not None for v in variants):
+                duration_option = (option, variants)
+                break
+
+    # Gather plan-capable variants from selectable options.
+    target_variants: List[Tuple[Dict, Dict]] = []
     for option, variants in visible_options:
         option_text = f"{option.get('label','')} {option.get('name','')}".lower()
         for variant in variants:
@@ -221,62 +305,116 @@ def extract_pro_choice(product_payload: Dict, base_price: float, currency: str) 
             if not text:
                 continue
             is_subscription_context = SUBSCRIPTION_RX.search(text) or SERVICE_OPTION_RX.search(option_text)
-            if PRO_RX.search(text) and is_subscription_context and not API_OFFER_RX.search(text):
-                pro_variants.append((option, variant))
+            tags = _plan_tags(text.lower())
+            # Common pattern: dedicated PRO toggle where "not needed" means base/Plus path.
+            if "подписк" in option_text and "pro" in option_text and NOT_PRO_RX.search(text.lower()):
+                tags.add("plus")
+            if tags & prefs["plans"] and is_subscription_context and not API_OFFER_RX.search(text):
+                target_variants.append((option, variant))
 
-    if not pro_variants:
-        return None
+    if not target_variants:
+        return []
 
-    for pro_option, pro_variant in pro_variants:
-        selected: Dict[int, Dict] = {}
-        duration_text = ""
-        for option, variants in visible_options:
-            key = int(option.get("id") or 0)
-            choice = default_variant(option, variants)
-            label_text = f"{option.get('label','')} {option.get('name','')}".lower()
-            is_activation_option = ACTIVATION_RX.search(label_text) or "тип подпис" in label_text
-
-            if option is pro_option:
-                choice = pro_variant
+    for target_option, target_variant in target_variants:
+        duration_candidates: List[Optional[Dict]] = [None]
+        if duration_option:
+            d_opt, d_vars = duration_option
+            all_duration_vars = [v for v in d_vars if _extract_duration_months(clean_text(str(v.get("text", "")))) is not None]
+            if prefs["months"]:
+                filtered = [
+                    v for v in all_duration_vars
+                    if (_extract_duration_months(clean_text(str(v.get("text", "")))) in prefs["months"])
+                ]
+                duration_candidates = filtered or [default_variant(d_opt, d_vars)]
             else:
-                # Prefer "activation/renewal" style option over account-creation variants.
-                if is_activation_option:
-                    act = next(
-                        (v for v in variants if ACTIVATION_RX.search(clean_text(str(v.get("text", "")).lower()))),
-                        None,
+                duration_candidates = all_duration_vars or [default_variant(d_opt, d_vars)]
+
+        for duration_variant in duration_candidates:
+            selected: Dict[int, Dict] = {}
+            duration_text = ""
+            for option, variants in visible_options:
+                key = int(option.get("id") or 0)
+                choice = default_variant(option, variants)
+                label_text = f"{option.get('label','')} {option.get('name','')}".lower()
+                is_activation_option = ACTIVATION_RX.search(label_text) or "тип подпис" in label_text
+
+                if option is target_option:
+                    choice = target_variant
+                elif duration_option and option is duration_option[0] and duration_variant is not None:
+                    choice = duration_variant
+                else:
+                    # Prefer "activation/renewal" style option over account-creation variants.
+                    if is_activation_option:
+                        act = next(
+                            (v for v in variants if ACTIVATION_RX.search(clean_text(str(v.get("text", "")).lower()))),
+                            None,
+                        )
+                        if act is not None:
+                            choice = act
+                    # Avoid explicit account creation variants when alternatives exist.
+                    if ACCOUNT_CREATE_RX.search(clean_text(str(choice.get("text", "")).lower())):
+                        better = next(
+                            (v for v in variants if not ACCOUNT_CREATE_RX.search(clean_text(str(v.get("text", "")).lower()))),
+                            None,
+                        )
+                        if better is not None:
+                            choice = better
+
+                if DURATION_OPTION_RX.search(label_text):
+                    duration_text = clean_text(str(choice.get("text", "")))
+
+                # For unrelated options choose the least-cost visible variant.
+                if (
+                    option is not target_option
+                    and not DURATION_OPTION_RX.search(label_text)
+                    and not is_activation_option
+                ):
+                    cheapest = min(
+                        variants,
+                        key=lambda v: _modifier_value(v, base_price, currency, rates),
                     )
-                    if act is not None:
-                        choice = act
-                # Avoid explicit account creation variants when alternatives exist.
-                if ACCOUNT_CREATE_RX.search(clean_text(str(choice.get("text", "")).lower())):
-                    better = next(
-                        (v for v in variants if not ACCOUNT_CREATE_RX.search(clean_text(str(v.get("text", "")).lower()))),
-                        None,
-                    )
-                    if better is not None:
-                        choice = better
+                    if _modifier_value(cheapest, base_price, currency, rates) < _modifier_value(choice, base_price, currency, rates):
+                        choice = cheapest
 
-            if DURATION_OPTION_RX.search(label_text):
-                duration_text = clean_text(str(choice.get("text", "")))
+                selected[key] = choice
 
-            # For unrelated options choose the least-cost visible variant.
-            if option is not pro_option and not DURATION_OPTION_RX.search(label_text) and not is_activation_option:
-                cheapest = min(
-                    variants,
-                    key=lambda v: _modifier_value(v, base_price, currency, rates),
-                )
-                if _modifier_value(cheapest, base_price, currency, rates) < _modifier_value(choice, base_price, currency, rates):
-                    choice = cheapest
+            total = _modifier_only_price(base_price, list(selected.values()), currency, rates)
+            choice_text = clean_text(str(target_variant.get("text", "")))
+            joined_selection_text = " ".join(clean_text(str(v.get("text", ""))) for v in selected.values())
+            duration = extract_duration(duration_text) or extract_duration(choice_text) or extract_duration(joined_selection_text)
+            duration_months = _extract_duration_months(duration_text) or _extract_duration_months(choice_text)
+            if duration_months is None:
+                duration_months = _extract_duration_months(joined_selection_text)
+            if API_OFFER_RX.search(choice_text):
+                continue
+            candidates.append((max(total, 0.0), choice_text, duration, duration_months))
 
-            selected[key] = choice
+    if not candidates:
+        return []
 
-        total = _modifier_only_price(base_price, list(selected.values()), currency, rates)
+    # Deduplicate and keep cheapest for each text/duration.
+    dedup: Dict[Tuple[str, str], Tuple[float, str, str, Optional[int]]] = {}
+    for c in candidates:
+        key = (c[1], c[2])
+        if key not in dedup or c[0] < dedup[key][0]:
+            dedup[key] = c
+    ordered = sorted(dedup.values(), key=lambda x: x[0])
 
-        pro_text = clean_text(str(pro_variant.get("text", "")))
-        duration = extract_duration(pro_text) or extract_duration(duration_text)
-        candidates.append((max(total, 0.0), pro_text, duration))
+    if prefs["months"]:
+        best_by_month: Dict[int, Tuple[float, str, str, Optional[int]]] = {}
+        for c in ordered:
+            m = c[3]
+            if m is None:
+                continue
+            if m in prefs["months"] and (m not in best_by_month or c[0] < best_by_month[m][0]):
+                best_by_month[m] = c
+        if best_by_month:
+            return [best_by_month[m][:3] for m in sorted(best_by_month.keys())]
 
-    return min(candidates, key=lambda x: x[0])
+    if return_all:
+        return [c[:3] for c in ordered]
+    # Default: return cheapest relevant choice.
+    return [ordered[0][:3]]
 
 
 def classify_offer(
@@ -284,6 +422,8 @@ def classify_offer(
     fallback_title: str,
     base_price: float,
     currency: str,
+    request_text: str,
+    return_all_choices: bool = False,
 ) -> Optional[Dict]:
     if int(details.get("retval", -1)) != 0:
         return None
@@ -297,22 +437,21 @@ def classify_offer(
         return None
 
     title = clean_text(str(product.get("name") or fallback_title))
-    pro_choice = extract_pro_choice(details, base_price, currency)
-    if not pro_choice:
+    choices = extract_matching_choices(
+        details,
+        base_price,
+        currency,
+        request_text=request_text,
+        return_all=return_all_choices,
+    )
+    if not choices:
         return None
-    pro_choice_text = pro_choice[1]
-    displayed_price = float(pro_choice[0])
-    parsed_duration = pro_choice[2]
-
-    text_for_classification = f"{title} {pro_choice_text}"
-    # Exclude API-key/token goods, keep only subscription-like PRO offers.
-    if API_OFFER_RX.search(text_for_classification):
+    # Exclude API-key/token goods.
+    if API_OFFER_RX.search(title):
         return None
     return {
-        "price_value": displayed_price,
-        "pro_choice_text": pro_choice_text,
         "title": title,
-        "duration": parsed_duration,
+        "choices": [{"price_value": float(c[0]), "choice_text": c[1], "duration": c[2]} for c in choices],
     }
 
 
@@ -324,6 +463,8 @@ def search_all_products(
     max_items: int,
     sort_by: str,
     max_pages: int,
+    request_text: str = "pro",
+    return_all_choices: bool = False,
 ) -> List[Dict]:
     query = parse_search_query(search_url)
     rows = []
@@ -358,26 +499,27 @@ def search_all_products(
             pid = item.get("product_id")
             seller_id = int(item.get("seller_id") or 0)
             base_price = float(item.get("price", 0))
-            displayed_price = base_price
-            pro_choice_text = ""
-            duration = extract_duration(name)
             seller_reviews = {"total": 0, "good": 0, "bad": 0}
 
             if pid not in product_cache:
                 product_cache[pid] = None
                 try:
                     details = fetch_json(build_product_data_url(int(pid), currency, lang), timeout=12)
-                    product_cache[pid] = classify_offer(details, name, base_price, currency)
+                    product_cache[pid] = classify_offer(
+                        details,
+                        name,
+                        base_price,
+                        currency,
+                        request_text=request_text,
+                        return_all_choices=return_all_choices,
+                    )
                 except Exception:
                     product_cache[pid] = None
 
             offer = product_cache[pid]
             if not offer:
                 continue
-            displayed_price = float(offer["price_value"])
-            pro_choice_text = str(offer["pro_choice_text"])
             name = str(offer["title"])
-            duration = str(offer.get("duration") or "") or extract_duration(pro_choice_text) or extract_duration(name) or duration
 
             if seller_id > 0:
                 if seller_id not in seller_cache:
@@ -393,18 +535,24 @@ def search_all_products(
                         seller_cache[seller_id] = {"total": 0, "good": 0, "bad": 0}
                 seller_reviews = seller_cache[seller_id]
 
-            row = {
-                "title": name,
-                "price": format_price(displayed_price, currency),
-                "price_value": displayed_price,
-                "duration": duration,
-                "seller": str(item.get("seller_name", "")),
-                "seller_reviews": seller_reviews["total"],
-                "seller_good_bad": f"{seller_reviews['good']}/{seller_reviews['bad']}",
-                "link": f"https://plati.market/itm/i/{pid}",
-                "pro_choice": pro_choice_text,
-            }
-            rows.append(row)
+            for choice in offer.get("choices", []):
+                displayed_price = float(choice.get("price_value", base_price))
+                choice_text = str(choice.get("choice_text", ""))
+                duration = str(choice.get("duration", "")) or extract_duration(choice_text) or extract_duration(name) or ""
+                row = {
+                    "title": name,
+                    "price": format_price(displayed_price, currency),
+                    "price_value": displayed_price,
+                    "duration": duration,
+                    "seller": str(item.get("seller_name", "")),
+                    "seller_reviews": seller_reviews["total"],
+                    "seller_good_bad": f"{seller_reviews['good']}/{seller_reviews['bad']}",
+                    "link": f"https://plati.market/itm/i/{pid}",
+                    "pro_choice": choice_text,
+                }
+                rows.append(row)
+                if len(rows) >= max_items:
+                    break
             if len(rows) >= max_items:
                 break
 
@@ -686,6 +834,7 @@ def main() -> int:
             max_items=args.max_items,
             sort_by=args.sort_by,
             max_pages=args.max_pages,
+            request_text=parse_search_query(args.url),
         )
         if args.cost_sort == "asc":
             rows.sort(key=lambda r: float(r.get("price_value", 0.0)))

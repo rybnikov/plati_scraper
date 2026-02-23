@@ -21,23 +21,24 @@ If your MCP client hangs on initialize, run server with debug stderr enabled:
 
 1. Call MCP tool `find_cheapest_reliable_options` with:
    - `query`: user search intent
-   - `limit`: requested count (default 5)
-   - `min_reviews`: default 500 unless user asks for looser filter
-   - `min_positive_ratio`: default 0.98 unless user asks for looser filter
+   - `limit`: requested lots count (default 5)
+   - `min_reviews`: optional seller reliability filter (default 0)
+   - `min_positive_ratio`: optional seller reliability filter (default 0)
    - `max_pages`: default 6 for broader scan
-2. Return results sorted by lowest `price_value` first.
-3. Include clickable listing links in final output.
-4. If no results, relax reliability thresholds once:
-   - `min_reviews`: 200
-   - `min_positive_ratio`: 0.95
-5. Clearly state filters used.
+2. Treat response as raw market data:
+   - each lot includes `options[]`
+   - each option group includes all visible `variants[]`
+   - each variant has computed `price_if_selected`
+3. Apply plan/duration/account-type filtering in the agent, not in MCP tool.
+4. Include clickable listing links and selected option text in final output.
+5. Clearly state filters used by the agent.
 
 ## Output format
 
-Return a compact ranked list:
+Return a compact ranked list based on agent-side filtering:
 
-`<rank>. <price> | <seller> | <duration> | <link>`
+`<rank>. <selected price> | <seller> | <selected duration> | <link>`
 
 Include a one-line summary:
 
-`Returned X reliable offers from Y candidates`
+`Returned X lots after agent filtering from Y raw lots`

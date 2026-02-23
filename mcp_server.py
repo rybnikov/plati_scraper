@@ -90,56 +90,142 @@ def find_cheapest_reliable_options(
     limit: int = 5,
     currency: str = "RUB",
     lang: str = "ru-RU",
-    min_reviews: int = 500,
-    min_positive_ratio: float = 0.98,
+    min_reviews: int = 0,
+    min_positive_ratio: float = 0.0,
     max_pages: int = 6,
     per_page: int = 30,
 ) -> Dict[str, Any]:
     if plati_scrape is None:
         raise RuntimeError(f"plati_scrape import failed: {_PLATI_IMPORT_ERROR}")
-    search_url = f"https://plati.market/search/{quote(query, safe='')}"
-    rows = plati_scrape.search_all_products(
-        search_url=search_url,
-        lang=lang,
-        currency=currency,
-        per_page=per_page,
-        max_items=per_page * max_pages,
-        sort_by="popular",
-        max_pages=max_pages,
-    )
 
-    filtered: List[Dict[str, Any]] = []
-    for row in rows:
-        reviews = int(row.get("seller_reviews", 0) or 0)
-        gb = _parse_good_bad(str(row.get("seller_good_bad", "0/0")))
-        total = gb["good"] + gb["bad"]
-        ratio = (gb["good"] / total) if total > 0 else 0.0
-        if reviews < min_reviews:
-            continue
-        if ratio < min_positive_ratio:
-            continue
-        filtered.append(
-            {
-                "title": row.get("title", ""),
-                "price": row.get("price", ""),
-                "price_value": float(row.get("price_value", 0.0) or 0.0),
-                "duration": row.get("duration", ""),
-                "seller": row.get("seller", ""),
-                "seller_reviews": reviews,
-                "good": gb["good"],
-                "bad": gb["bad"],
-                "positive_ratio": round(ratio, 4),
-                "link": row.get("link", ""),
-                "pro_option": row.get("pro_choice", ""),
-            }
-        )
+    q = quote(query, safe="")
+    lots: List[Dict[str, Any]] = []
+    seller_cache: Dict[int, Dict[str, Any]] = {}
+    page = 1
 
-    filtered.sort(key=lambda r: (r["price_value"], -r["seller_reviews"]))
-    top = filtered[: max(1, int(limit))]
+    while page <= max_pages and len(lots) < max(1, int(limit)):
+        search_url = plati_scrape.build_search_url(q, page, per_page, currency, lang, "popular")
+        payload = plati_scrape.fetch_json(search_url)
+        content = payload.get("content") or {}
+        items = content.get("items") or []
+        if not items:
+            break
+
+        for item in items:
+            pid = int(item.get("product_id") or 0)
+            seller_id = int(item.get("seller_id") or 0)
+            if pid <= 0:
+                continue
+
+            try:
+                details = plati_scrape.fetch_json(plati_scrape.build_product_data_url(pid, currency, lang), timeout=12)
+            except Exception:
+                continue
+            if int(details.get("retval", -1)) != 0:
+                continue
+
+            product = details.get("product") or {}
+            if not product:
+                continue
+            if str(product.get("is_available", 1)).lower() in {"0", "false"}:
+                continue
+
+            base_price = float(product.get("price") or item.get("price") or 0.0)
+            title = plati_scrape.clean_text(str(product.get("name") or plati_scrape.pick_name(item.get("name") or [], lang)))
+            link = f"https://plati.market/itm/i/{pid}"
+            seller_name = str((product.get("seller") or {}).get("name") or item.get("seller_name") or "")
+
+            if seller_id > 0 and seller_id not in seller_cache:
+                seller_cache[seller_id] = {"total": 0, "good": 0, "bad": 0, "positive_ratio": 0.0}
+                try:
+                    reviews = plati_scrape.fetch_json(plati_scrape.build_reviews_url(seller_id, lang), timeout=10)
+                    good = int(reviews.get("totalGood", 0) or 0)
+                    bad = int(reviews.get("totalBad", 0) or 0)
+                    total = good + bad
+                    seller_cache[seller_id] = {
+                        "total": int(reviews.get("totalItems", 0) or 0),
+                        "good": good,
+                        "bad": bad,
+                        "positive_ratio": (good / total) if total > 0 else 0.0,
+                    }
+                except Exception:
+                    pass
+            seller_info = seller_cache.get(seller_id, {"total": 0, "good": 0, "bad": 0, "positive_ratio": 0.0})
+            if int(seller_info.get("total", 0)) < min_reviews:
+                continue
+            if float(seller_info.get("positive_ratio", 0.0)) < min_positive_ratio:
+                continue
+
+            rates = plati_scrape._build_rate_map(product)
+            options_payload = []
+            min_option_price = base_price
+            for opt in (product.get("options") or []):
+                variants = [v for v in (opt.get("variants") or []) if int(v.get("visible", 1) or 0) == 1]
+                if not variants:
+                    continue
+                option_variants = []
+                for v in variants:
+                    delta = plati_scrape._modifier_value(v, base_price, currency, rates)
+                    price_if_selected = max(base_price + delta, 0.0)
+                    if price_if_selected < min_option_price:
+                        min_option_price = price_if_selected
+                    option_variants.append(
+                        {
+                            "value": v.get("value"),
+                            "text": plati_scrape.clean_text(str(v.get("text", ""))),
+                            "default": int(v.get("default", 0) or 0),
+                            "modify": v.get("modify"),
+                            "modify_type": v.get("modify_type"),
+                            "modify_value": float(v.get("modify_value_default") or v.get("modify_value") or 0.0),
+                            "price_if_selected": price_if_selected,
+                            "price_if_selected_fmt": plati_scrape.format_price(price_if_selected, currency),
+                        }
+                    )
+                options_payload.append(
+                    {
+                        "id": opt.get("id"),
+                        "name": opt.get("name"),
+                        "label": opt.get("label"),
+                        "type": opt.get("type"),
+                        "required": int(opt.get("required", 0) or 0),
+                        "variants": option_variants,
+                    }
+                )
+
+            lots.append(
+                {
+                    "product_id": pid,
+                    "title": title,
+                    "base_price": base_price,
+                    "base_price_fmt": plati_scrape.format_price(base_price, currency),
+                    "currency": currency,
+                    "prices_default": (product.get("prices") or {}).get("default") or {},
+                    "min_option_price": min_option_price,
+                    "min_option_price_fmt": plati_scrape.format_price(min_option_price, currency),
+                    "seller": seller_name,
+                    "seller_reviews": seller_info.get("total", 0),
+                    "good": seller_info.get("good", 0),
+                    "bad": seller_info.get("bad", 0),
+                    "positive_ratio": round(float(seller_info.get("positive_ratio", 0.0)), 4),
+                    "link": link,
+                    "options": options_payload,
+                }
+            )
+
+            if len(lots) >= max(1, int(limit)):
+                break
+        if len(lots) >= max(1, int(limit)):
+            break
+        if not content.get("has_next_page"):
+            break
+        page += 1
+
+    lots.sort(key=lambda x: (x["min_option_price"], -int(x.get("seller_reviews", 0))))
+    top = lots[: max(1, int(limit))]
     return {
         "query": query,
-        "total_candidates": len(rows),
-        "reliable_candidates": len(filtered),
+        "total_candidates": len(lots),
+        "reliable_candidates": len(lots),
         "returned": len(top),
         "items": top,
     }
@@ -155,8 +241,8 @@ TOOL_SCHEMA = {
             "limit": {"type": "integer", "default": 5, "minimum": 1, "maximum": 50},
             "currency": {"type": "string", "default": "RUB"},
             "lang": {"type": "string", "default": "ru-RU"},
-            "min_reviews": {"type": "integer", "default": 500, "minimum": 0},
-            "min_positive_ratio": {"type": "number", "default": 0.98, "minimum": 0, "maximum": 1},
+            "min_reviews": {"type": "integer", "default": 0, "minimum": 0},
+            "min_positive_ratio": {"type": "number", "default": 0.0, "minimum": 0, "maximum": 1},
             "max_pages": {"type": "integer", "default": 6, "minimum": 1, "maximum": 30},
             "per_page": {"type": "integer", "default": 30, "minimum": 5, "maximum": 100},
         },
