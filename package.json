@@ -1,6 +1,6 @@
 {
   "name": "plati-mcp-server",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "MCP stdio server for finding cheapest reliable subscription offers on Plati.",
   "license": "MIT",
   "type": "commonjs",

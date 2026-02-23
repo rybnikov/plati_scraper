@@ -13,6 +13,10 @@ Configure an MCP server named `plati-scraper` in your local OpenClaw/Claude conf
 
 `command: plati-mcp-server`
 
+If your MCP client hangs on initialize, run server with debug stderr enabled:
+
+`PLATI_MCP_STDERR=1 plati-mcp-server`
+
 ## Workflow
 
 1. Call MCP tool `find_cheapest_reliable_options` with:

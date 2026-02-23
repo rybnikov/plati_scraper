@@ -1,10 +1,23 @@
 #!/usr/bin/env python3
 import json
+import os
+import pathlib
 import sys
+import warnings
 from typing import Any, Dict, List
 from urllib.parse import quote
 
-import plati_scrape
+# Ensure local imports work even when launcher does not pass PYTHONPATH/cwd.
+_HERE = pathlib.Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+_PLATI_IMPORT_ERROR = ""
+try:
+    import plati_scrape
+except Exception as e:  # pragma: no cover - defensive path
+    plati_scrape = None  # type: ignore[assignment]
+    _PLATI_IMPORT_ERROR = str(e)
 
 
 def _read_message() -> Dict[str, Any]:
@@ -56,6 +69,8 @@ def find_cheapest_reliable_options(
     max_pages: int = 6,
     per_page: int = 30,
 ) -> Dict[str, Any]:
+    if plati_scrape is None:
+        raise RuntimeError(f"plati_scrape import failed: {_PLATI_IMPORT_ERROR}")
     search_url = f"https://plati.market/search/{quote(query, safe='')}"
     rows = plati_scrape.search_all_products(
         search_url=search_url,
@@ -138,6 +153,8 @@ def _handle_request(msg: Dict[str, Any]) -> Dict[str, Any]:
                 "serverInfo": {"name": "plati-scraper-mcp", "version": "0.1.0"},
             },
         )
+    if method == "ping":
+        return _ok(req_id, {})
     if method == "tools/list":
         return _ok(req_id, {"tools": [TOOL_SCHEMA]})
     if method == "tools/call":
@@ -172,6 +189,15 @@ def _handle_request(msg: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def main() -> int:
+    # Some MCP clients incorrectly merge stderr/stdout. Keep stderr quiet by default.
+    # Set PLATI_MCP_STDERR=1 to keep stderr for debugging.
+    if os.environ.get("PLATI_MCP_STDERR", "0") != "1":
+        try:
+            sys.stderr = open(os.devnull, "w", encoding="utf-8")
+        except Exception:
+            pass
+    warnings.filterwarnings("ignore")
+
     while True:
         try:
             msg = _read_message()
@@ -181,7 +207,7 @@ def main() -> int:
             continue
 
         if "id" not in msg:
-            # Notification: ignore.
+            # Notifications (e.g. notifications/initialized) are allowed and require no response.
             continue
         response = _handle_request(msg)
         _write_message(response)
